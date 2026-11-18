@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Last Memory</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/galmuri/dist/galmuri.css">
+<style>
+@import url("https://fonts.googleapis.com/css2?family=Silkscreen&display=swap");
+*{box-sizing:border-box}
+body{margin:0;background:#080c13;color:#eaf1ff;font:16px Galmuri11,system-ui,sans-serif}
+canvas{position:fixed;inset:0;width:100%;height:100%}
+header{position:fixed;inset:0 0 auto;padding:clamp(16px,4vw,48px);display:flex;align-items:flex-start;justify-content:space-between;gap:12px;pointer-events:none}
+.brand,time,h1{font-family:Silkscreen,Galmuri11,Consolas,monospace;font-weight:400}
+.brand{color:#a8c4ff;font-size:clamp(12px,2vw,22px)}
+time{font-size:clamp(22px,5vw,60px);line-height:1;white-space:nowrap}
+.panel{position:fixed;top:40%;left:50%;transform:translate(-50%,-50%);width:min(560px,calc(100% - 32px));padding:clamp(22px,5vw,44px);background:#0c1320ed;border:1px solid #293d60;box-shadow:0 16px 80px #0008}
+.panel[hidden]{display:none}
+h1{font-size:clamp(25px,7vw,54px);line-height:1.05;margin:0 0 18px}
+p{margin:0 0 22px;line-height:1.65;color:#b4c4df}
+p:empty{display:none}
+button{font:inherit;font-weight:700;padding:12px 20px;background:#a8c4ff;color:#081122;border:0;cursor:pointer}
+button:disabled{opacity:.6;cursor:wait}
+button:focus-visible{outline:2px solid white;outline-offset:5px}
+video{display:none}
+</style>
+</head>
+<body>
+<canvas id="field" aria-hidden="true"></canvas>
+<header><div class="brand">Last Memory</div><time id="clock">01:00</time></header>
+<main id="panel" class="panel">
+<h1 id="title">Last Memory</h1>
+<p id="message" aria-live="polite">눈을 깜빡여서 기억 데이터를 붙잡으세요</p>
+<button id="start">웹캠 켜고 시작</button>
+</main>
+<video id="video" playsinline muted></video>
+<script>
+const DURATION = 60000;
+const ACCELERATE_AT = 40000;
+const SWEEP_INTERVAL = 3000;
+const FAST_SWEEP_INTERVAL = 900;
+const MIN_SWEEP_INTERVAL = 120;
+const REMOVAL_SPACING = 28;
+const TILE_FADE = 240;
+const PALE_REMOVAL_WEIGHT = .75;
+const GRAY = 0, PALE = 1, BLUE = 2;
+const colors = ['#929da9', '#a5bfdc', '#2667ff'];
+
+class Round {
+  constructor(start, random = Math.random) {
+    this.start = start;
+    this.random = random;
+    this.tiles = [];
+    this.blinks = 0;
+    this.serial = 0;
+    this.nextSweep = SWEEP_INTERVAL;
+    this.nextFadeAt = start;
+    this.nextCleanupAt = DURATION;
+  }
+
+  blink(now) {
+    const elapsed = now - this.start;
+    if (elapsed < 0 || elapsed >= DURATION) return;
+    this.blinks++;
+    const guarantee = elapsed >= 40000 && !this.tiles.some(tile => tile.type === BLUE);
+    for (let i = 0; i < 3; i++) {
+      const roll = this.random();
+      const type = guarantee && i === 0 ? BLUE : roll < .72 ? GRAY : roll < .99 ? PALE : BLUE;
+      this.tiles.push({type, id: ++this.serial, born: now});
+    }
+  }
+
+  scheduleRemoval(amount) {
+    const gray = [];
+    const pale = [];
+    for (const tile of this.tiles) {
+      if (tile.pending) continue;
+      if (tile.type === GRAY) gray.push(tile);
+      if (tile.type === PALE) pale.push(tile);
+    }
+    for (let i = 0; i < amount && gray.length + pale.length > 0; i++) {
+      const grayWeight = gray.length;
+      const totalWeight = grayWeight + pale.length * PALE_REMOVAL_WEIGHT;
+      const chosen = this.random() * totalWeight < grayWeight ? gray : pale;
+      chosen.shift().pending = true;
+    }
+  }
+
+  update(now) {
+    const elapsed = now - this.start;
+    if (elapsed >= DURATION) {
+      if (elapsed >= this.nextCleanupAt) {
+        this.scheduleRemoval(1);
+        this.nextCleanupAt = elapsed + REMOVAL_SPACING;
+      }
+    } else if (elapsed >= this.nextSweep) {
+      if (elapsed < ACCELERATE_AT) {
+        this.scheduleRemoval(3);
+        this.nextSweep = Math.min(elapsed + SWEEP_INTERVAL, ACCELERATE_AT);
+      } else {
+        const progress = (elapsed - ACCELERATE_AT) / (DURATION - ACCELERATE_AT);
+        this.scheduleRemoval(6 + Math.floor(14 * progress));
+        const interval = FAST_SWEEP_INTERVAL * (MIN_SWEEP_INTERVAL / FAST_SWEEP_INTERVAL) ** progress;
+        this.nextSweep = elapsed + interval;
+      }
+    }
+    this.tiles = this.tiles.filter(tile => tile.removed === undefined || now - tile.removed <= TILE_FADE);
+  }
+}
+
+class BlinkGate {
+  constructor() {
+    this.reset();
+  }
+
+  reset() {
+    this.openAt = -Infinity;
+    this.eyeClosedAt = [-Infinity, -Infinity];
+    this.closedAt = null;
+  }
+
+  sample(now, eyes, baseline) {
+    const signals = eyes.ratios.map((ratio, i) => {
+      const aperture = ratio / baseline[i].ratio;
+      const score = eyes.scores[i];
+      const increase = score - baseline[i].score;
+      return {
+        closed: aperture <= .68 || (aperture <= .88 && increase >= .14) ||
+          (aperture <= .96 && increase >= .24 && score >= .43),
+        open: aperture >= .79 && (increase <= .11 || score < .25)
+      };
+    });
+    const bothOpen = signals.every(signal => signal.open && !signal.closed);
+
+    if (this.closedAt !== null) {
+      if (now - this.closedAt > 540) {
+        this.reset();
+      } else if (bothOpen) {
+        this.reset();
+        this.openAt = now;
+        return true;
+      }
+      return false;
+    }
+
+    if (bothOpen) {
+      this.openAt = now;
+      this.eyeClosedAt.fill(-Infinity);
+    } else if (now - this.openAt <= 320) {
+      signals.forEach((signal, i) => {
+        if (signal.closed) this.eyeClosedAt[i] = now;
+      });
+      if (this.eyeClosedAt.every(time => now - time <= 85)) this.closedAt = now;
+    }
+    return false;
+  }
+}
+
+const byId = id => document.getElementById(id);
+const canvas = byId('field'), ctx = canvas.getContext('2d'), video = byId('video');
+const start = byId('start'), panel = byId('panel');
+const eyes = [[263,362,385,380,387,373], [33,133,160,144,158,153]];
+const gate = new BlinkGate();
+let model, stream, round, phase = 'idle', width, height, videoTime = -1, frameAt, drawAt;
+// Eye aspect ratios use pixel distances because landmarks are normalized per axis.
+function distance(a, b) {
+  return Math.hypot((a.x - b.x) * video.videoWidth, (a.y - b.y) * video.videoHeight);
+}
+function readEyes(result) {
+  const landmarks = result.faceLandmarks[0];
+  const shapes = result.faceBlendshapes?.[0]?.categories;
+  if (!landmarks || !shapes) return null;
+  const scores = Object.fromEntries(shapes.map(({categoryName, score}) => [categoryName, score]));
+  if (distance(landmarks[33], landmarks[263]) < video.videoWidth * .075) return null;
+  const ratios = eyes.map(indices => {
+    const [a,b,c,d,e,f] = indices.map(index => landmarks[index]);
+    return (distance(c,d) + distance(e,f)) / (2 * distance(a,b));
+  });
+  if (!ratios.every(Number.isFinite) || !Number.isFinite(scores.eyeBlinkLeft) ||
+      !Number.isFinite(scores.eyeBlinkRight)) return null;
+  return {ratios, scores: [scores.eyeBlinkLeft, scores.eyeBlinkRight]};
+}
+
+let calibration = [], baseline = [];
+function track(now) {
+  if (now - frameAt > 260) gate.reset();
+  if (video.readyState < 2 || video.currentTime === videoTime) return;
+  videoTime = video.currentTime;
+  frameAt = now;
+  const sample = readEyes(model.detectForVideo(video, now));
+  if (!sample) {
+    gate.reset();
+    return;
+  }
+  if (phase === 'calibrate') {
+    if (sample.ratios.some(ratio => ratio < .075)) return;
+    calibration.push({now, ...sample});
+    if (calibration.length < 6 || now - calibration[0].now < 420) return;
+    baseline = sample.ratios.map((_, i) => {
+      const ranked = [...calibration].sort((a,b) => a.ratios[i] - b.ratios[i]);
+      const openSamples = ranked.slice(Math.floor(ranked.length / 2));
+      const scores = openSamples.map(reading => reading.scores[i]).sort((a,b) => a-b);
+      return {
+        ratio: openSamples[Math.floor(openSamples.length / 2)].ratios[i],
+        score: scores[Math.floor(scores.length / 2)]
+      };
+    });
+    phase = 'verify';
+    byId('message').textContent = '두 눈을 편하게 한 번 깜빡이면 게임이 시작됩니다.';
+  }
+
+  if (!gate.sample(now, sample, baseline)) return;
+  if (phase === 'verify') {
+    phase = 'running';
+    panel.hidden = true;
+    round = new Round(now);
+  }
+  round.blink(now);
+}
+
+function resize() {
+  width = innerWidth;
+  height = innerHeight;
+  const density = Math.min(devicePixelRatio || 1, 2);
+  canvas.width = Math.round(width * density);
+  canvas.height = Math.round(height * density);
+  ctx.setTransform(density, 0, 0, density, 0, 0);
+}
+addEventListener('resize', resize);
+resize();
+
+function draw(now) {
+  const dt = Math.min(.043, (now - (drawAt ?? now)) / 1000);
+  drawAt = now;
+  ctx.clearRect(0, 0, width, height);
+  const pad = Math.min(48, Math.max(16, width * .04));
+  const bottom = Math.max(80, height - pad);
+  const fieldWidth = width - 2 * pad;
+  const fieldHeight = Math.max(72, bottom - 100);
+  let rack = width < 550 ? 53 : 68;
+  const tileCount = round?.tiles.length ?? 0;
+  while (Math.max(1, Math.floor(fieldWidth / rack)) *
+         Math.max(1, Math.floor(fieldHeight / rack)) < tileCount) rack *= .94;
+  const cols = Math.max(1, Math.floor(fieldWidth / rack));
+  const size = rack * .90;
+  const left = (width - cols * rack) / 2;
+
+  if (!round) return;
+
+  const stackHeights = Array(cols).fill(0);
+  const stackTops = Array(cols).fill(0);
+  const grounded = Array(cols).fill(true);
+  for (const tile of round.tiles) {
+    const departing = tile.removed !== undefined;
+    if (tile.column === undefined || tile.column >= cols) {
+      const first = Math.floor(cols / 2);
+      const order = Array.from({length: cols}, (_, i) => (first + i) % cols);
+      tile.column = order.reduce((best, col) => stackHeights[col] < stackHeights[best] ? col : best);
+    }
+
+    const floor = stackTops[tile.column] + (stackHeights[tile.column] ? rack : size);
+    if (!departing) stackHeights[tile.column]++;
+    if (tile.lift === undefined) {
+      tile.lift = Math.max(bottom - 68 + ((tile.id - 1) % 3) * 32, floor);
+      tile.velocity = 0;
+    }
+    if (!departing) {
+      tile.velocity = Math.max(-2400, tile.velocity - 4200 * dt);
+      tile.lift += tile.velocity * dt;
+      if (tile.lift <= floor) {
+        tile.lift = floor;
+        if (grounded[tile.column]) {
+          tile.landed = true;
+          if (tile.pending && now >= round.nextFadeAt) {
+            tile.removed = now;
+            round.nextFadeAt = now + REMOVAL_SPACING;
+          }
+        }
+        tile.velocity = tile.velocity < -220 ? -tile.velocity * .14 : 0;
+      }
+      grounded[tile.column] &&= tile.lift === floor;
+    }
+
+    if (!departing) stackTops[tile.column] = tile.lift;
+
+    const x = left + tile.column * rack + (rack - size) / 2;
+    const y = bottom - tile.lift;
+    ctx.globalAlpha = departing ? Math.max(0, 1 - (now - tile.removed) / TILE_FADE) : 1;
+    ctx.fillStyle = colors[tile.type];
+    ctx.fillRect(x, y, size, size);
+    ctx.fillStyle = tile.type === BLUE ? '#e4eeff' : '#18263b';
+    ctx.font = Math.max(6, size * .19) + 'px Consolas, monospace';
+    ctx.fillText(tile.id.toString(16).toUpperCase().padStart(4, '0'), x + size * .12, y + size * .32, size * .76);
+    for (let bit = 0; bit < 8; bit++) {
+      ctx.fillRect(x + size * (.12 + bit * .095), y + size * .7, size * .035,
+        size * ((tile.id & (1 << bit)) ? .18 : .08));
+    }
+  }
+  ctx.globalAlpha = 1;
+
+
+}
+
+function stopCamera() {
+  stream?.getTracks().forEach(track => track.stop());
+  stream = null;
+  video.srcObject = null;
+}
+function finish() {
+  phase = 'done';
+  stopCamera();
+  panel.hidden = false;
+  byId('message').textContent = '';
+  start.textContent = '다시 시작';
+  start.disabled = false;
+
+}
+function fail(error) {
+  console.error(error);
+  stopCamera();
+  phase = 'idle';
+  panel.hidden = false;
+  byId('title').textContent = 'Last Memory';
+  const errors = {
+    NotAllowedError: '브라우저에서 카메라 권한을 허용한 뒤 다시 시작하세요.',
+    NotFoundError: '연결된 카메라를 찾지 못했습니다.',
+    NotReadableError: '카메라를 사용하는 다른 앱을 닫고 다시 시작하세요.'
+  };
+  byId('message').textContent = errors[error.name] || error.userMessage ||
+    '눈 추적을 시작할 수 없습니다. 인터넷 연결을 확인하고 Chrome 또는 Edge에서 다시 시도하세요.';
+  start.textContent = '다시 시도';
+  start.disabled = false;
+
+}
+
+start.addEventListener('click', async () => {
+  phase = 'loading';
+  round = null;
+
+
+  byId('clock').textContent = '01:00';
+
+  start.disabled = true;
+  byId('title').textContent = 'Last Memory';
+  byId('message').textContent = '카메라 권한을 허용해 주세요.';
+  try {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      const error = new Error('Camera unavailable');
+      error.userMessage = 'Chrome 또는 Edge에서 이 HTML 파일을 직접 열어 주세요.';
+      throw error;
+    }
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: {width: {ideal:640}, height: {ideal:480}, frameRate:{ideal:60}}, audio:false
+    });
+    video.srcObject = stream;
+    await video.play();
+    byId('message').textContent = '눈 추적 모델을 불러오는 중입니다.';
+    if (!model) {
+      const base = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21';
+      const {FilesetResolver, FaceLandmarker} = await import(base + '/vision_bundle.mjs');
+      const wasm = await FilesetResolver.forVisionTasks(base + '/wasm');
+      const modelAssetPath = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
+      const createModel = delegate => FaceLandmarker.createFromOptions(wasm, {
+        baseOptions: {modelAssetPath, delegate},
+        runningMode:'VIDEO', numFaces:1, outputFaceBlendshapes:true,
+        minFaceDetectionConfidence:.5, minFacePresenceConfidence:.5, minTrackingConfidence:.5
+      });
+      try {
+        model = await createModel('GPU');
+      } catch {
+        model = await createModel('CPU');
+      }
+    }
+    videoTime = -1;
+    frameAt = performance.now();
+    calibration = [];
+    gate.reset();
+    byId('message').textContent = '두 눈을 뜨고 카메라를 정면으로 바라봐 주세요.';
+
+    phase = 'calibrate';
+  } catch (error) {
+    fail(error);
+  }
+});
+
+function frame(now) {
+  if (phase === 'running' || phase === 'settling') {
+    const elapsed = now - round.start;
+    const seconds = Math.ceil(Math.max(0, DURATION - elapsed) / 1000);
+    byId('clock').textContent = seconds === 60 ? '01:00' : '00:' + String(seconds).padStart(2,'0');
+
+    round.update(now);
+    if (elapsed >= DURATION && phase === 'running') {
+      phase = 'settling';
+      stopCamera();
+    }
+    if (phase === 'settling' && round.tiles.every(tile => tile.type === BLUE && tile.landed)) finish();
+  }
+  if (phase === 'calibrate' || phase === 'verify' || phase === 'running') {
+    try {
+      track(now);
+    } catch (error) {
+      fail(error);
+    }
+  }
+  draw(now);
+  requestAnimationFrame(frame);
+}
+addEventListener('pagehide', stopCamera);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
+
